@@ -3,7 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const {
   Client, GatewayIntentBits, PermissionFlagsBits, ChannelType, EmbedBuilder,
-  ActionRowBuilder, StringSelectMenuBuilder, ButtonBuilder, ButtonStyle,
+  ActionRowBuilder, StringSelectMenuBuilder, ChannelSelectMenuBuilder, ButtonBuilder, ButtonStyle,
   ModalBuilder, TextInputBuilder, TextInputStyle, SlashCommandBuilder,
   AttachmentBuilder, MessageFlags,
 } = require('discord.js');
@@ -39,6 +39,7 @@ const cfg = (guildId) => {
 /* ---------- slash commands ---------- */
 const commands = [
   new SlashCommandBuilder().setName('ticket').setDescription('Ticket system')
+    .addSubcommand(s => s.setName('settings').setDescription('Choose where each ticket type is created'))
     .addSubcommand(s => s.setName('setup').setDescription('Send the ticket panel')
       .addChannelOption(o => o.setName('channel').setDescription('Where to send the panel').addChannelTypes(ChannelType.GuildText).setRequired(true)))
     .addSubcommand(s => s.setName('transcript-channel').setDescription('Channel where transcripts go')
@@ -87,6 +88,139 @@ const slug = (s) => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g
 const esc = (s = '') => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 const reply = (i, content) => i.reply({ content, flags: MessageFlags.Ephemeral });
 
+function ticketSettingsOverview(guild) {
+  const c = cfg(guild.id);
+  const embed = new EmbedBuilder()
+    .setTitle('⚙️ Ticket Settings')
+    .setDescription('Choose a ticket type to change its folder, or change the default folder used by ticket types without their own folder.')
+    .setColor(0x5865f2);
+
+  if (!c.categories.length) {
+    embed.addFields({ name: 'Ticket types', value: 'No ticket types yet. Add one with `/ticket category-add`.' });
+  } else {
+    for (const cat of c.categories.slice(0, 25)) {
+      const destinationId = cat.parentId || c.parentId;
+      const destination = destinationId ? guild.channels.cache.get(destinationId) : null;
+      const destinationText = destinationId
+        ? (destination ? `<#${destinationId}>` : '`Folder unavailable — choose another`')
+        : '`Not set`';
+      const routingText = cat.parentId ? 'Custom folder' : 'Uses the default folder';
+      embed.addFields({
+        name: `${cat.emoji || '🎫'} ${cat.label}`.slice(0, 256),
+        value: `${destinationText}\n_${routingText}_`,
+        inline: true,
+      });
+    }
+  }
+
+  const components = [];
+  if (c.categories.length) {
+    const menu = new StringSelectMenuBuilder()
+      .setCustomId('ticket_settings_type')
+      .setPlaceholder('Choose a ticket type...')
+      .addOptions(c.categories.slice(0, 25).map(cat => ({
+        label: cat.label.slice(0, 100),
+        value: cat.id,
+        ...(cat.emoji ? { emoji: cat.emoji } : {}),
+      })));
+    components.push(new ActionRowBuilder().addComponents(menu));
+  }
+
+  components.push(new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('ticket_settings_default')
+      .setLabel('Change default folder')
+      .setStyle(ButtonStyle.Secondary),
+  ));
+
+  return { embeds: [embed], components };
+}
+
+function ticketSettingsDetail(guild, cat, notice = '') {
+  const c = cfg(guild.id);
+  const destinationId = cat.parentId || c.parentId;
+  const destination = destinationId ? guild.channels.cache.get(destinationId) : null;
+  const currentDestination = destinationId
+    ? (destination ? `<#${destinationId}>` : '`Folder unavailable`')
+    : '`Not set — tickets will be created without a parent folder`';
+  const routingMode = cat.parentId ? 'This ticket type has its own folder.' : 'This ticket type uses the default ticket folder.';
+
+  const embed = new EmbedBuilder()
+    .setTitle(`${cat.emoji || '🎫'} ${cat.label} Ticket Folder`)
+    .setDescription([
+      notice,
+      `**Current folder:** ${currentDestination}`,
+      routingMode,
+      '',
+      'Choose a Discord category below. The change is saved automatically and applies to new tickets.',
+    ].filter(Boolean).join('\n'))
+    .setColor(0x5865f2);
+
+  const channelMenu = new ChannelSelectMenuBuilder()
+    .setCustomId(`ticket_settings_parent:${cat.id}`)
+    .setPlaceholder('Select a Discord folder...')
+    .setChannelTypes(ChannelType.GuildCategory)
+    .setMinValues(1)
+    .setMaxValues(1);
+
+  const buttons = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`ticket_settings_reset:${cat.id}`)
+      .setLabel('Use default folder')
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId('ticket_settings_back')
+      .setLabel('Back')
+      .setStyle(ButtonStyle.Primary),
+  );
+
+  return {
+    embeds: [embed],
+    components: [new ActionRowBuilder().addComponents(channelMenu), buttons],
+  };
+}
+
+function ticketSettingsDefaultDetail(guild, notice = '') {
+  const c = cfg(guild.id);
+  const destination = c.parentId ? guild.channels.cache.get(c.parentId) : null;
+  const currentDestination = c.parentId
+    ? (destination ? `<#${c.parentId}>` : '`Folder unavailable`')
+    : '`Not set`';
+  const embed = new EmbedBuilder()
+    .setTitle('📁 Default Ticket Folder')
+    .setDescription([
+      notice,
+      `**Current default folder:** ${currentDestination}`,
+      'Ticket types with a custom folder will keep using their own folder. All other ticket types will use this default.',
+      '',
+      'Choose a Discord category below. The change is saved automatically.',
+    ].filter(Boolean).join('\n'))
+    .setColor(0x5865f2);
+
+  const channelMenu = new ChannelSelectMenuBuilder()
+    .setCustomId('ticket_settings_default_parent')
+    .setPlaceholder('Select the default Discord folder...')
+    .setChannelTypes(ChannelType.GuildCategory)
+    .setMinValues(1)
+    .setMaxValues(1);
+
+  const buttons = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('ticket_settings_default_reset')
+      .setLabel('Clear default folder')
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId('ticket_settings_back')
+      .setLabel('Back')
+      .setStyle(ButtonStyle.Primary),
+  );
+
+  return {
+    embeds: [embed],
+    components: [new ActionRowBuilder().addComponents(channelMenu), buttons],
+  };
+}
+
 function panelMessage(guild) {
   const c = cfg(guild.id);
   const embed = new EmbedBuilder()
@@ -130,6 +264,27 @@ body{background:#313338;color:#dbdee1;font-family:Arial,sans-serif;padding:20px}
 .t{color:#949ba4;font-size:12px}.embed{border-left:4px solid #5865f2;padding:4px 8px;background:#2b2d31;margin-top:4px}
 a{color:#00a8fc}</style></head><body><h2>Transcript: #${esc(channel.name)}</h2><hr>${rows}</body></html>`;
   return { html, count: all.length };
+}
+
+async function deleteClosedTicket(i) {
+  const c = cfg(i.guild.id);
+  const channel = i.channel;
+
+  if (!isStaff(i, c)) return reply(i, '❌ Staff only.');
+  if (!c.closed[channel.id]) return reply(i, '❌ This is not a closed ticket.');
+
+  await i.reply({ content: '🗑️ Deleting this closed ticket...', flags: MessageFlags.Ephemeral });
+  try {
+    await channel.delete(`Closed ticket deleted by ${i.user.tag}`);
+    delete c.closed[channel.id];
+    save();
+  } catch (err) {
+    console.error('Closed ticket deletion failed:', err);
+    await i.followUp({
+      content: `❌ Could not delete this ticket (${err.message}). Make sure the bot has Manage Channels permission.`,
+      flags: MessageFlags.Ephemeral,
+    }).catch(() => {});
+  }
 }
 
 async function closeTicket(i, reason) {
@@ -193,10 +348,19 @@ async function closeTicket(i, reason) {
     problems.push(`Could not move/lock the channel (${e.message}). Give the bot Manage Channels in that category.`);
   }
 
+  const deleteRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('ticket_delete_closed')
+      .setLabel('Delete')
+      .setEmoji('🗑️')
+      .setStyle(ButtonStyle.Danger),
+  );
+
   await channel.send({
     content: problems.length ? `⚠️ ${problems.join('\n')}` : undefined,
-    embeds: [embed.setDescription('This ticket is closed. Staff can delete it with `/ticket delete`.')],
-  }).catch(() => {});
+    embeds: [embed.setDescription('This ticket is closed. Staff can delete it using the button below.')],
+    components: [deleteRow],
+  }).catch((err) => console.error('Could not post closed-ticket controls:', err));
 }
 
 /* ---------- interactions ---------- */
@@ -208,9 +372,12 @@ client.on('interactionCreate', async (i) => {
     /* slash commands */
     if (i.isChatInputCommand() && i.commandName === 'ticket') {
       const sub = i.options.getSubcommand();
-      const adminOnly = ['setup', 'transcript-channel', 'staff-role', 'parent', 'category-add', 'category-remove', 'category-parent', 'closed-category'];
+      const adminOnly = ['settings', 'setup', 'transcript-channel', 'staff-role', 'parent', 'category-add', 'category-remove', 'category-parent', 'closed-category'];
       if (adminOnly.includes(sub) && !isAdmin(i)) return reply(i, '❌ You need Manage Server permission.');
 
+      if (sub === 'settings') {
+        return i.reply({ ...ticketSettingsOverview(i.guild), flags: MessageFlags.Ephemeral });
+      }
       if (sub === 'setup') {
         const ch = i.options.getChannel('channel');
         await ch.send(panelMessage(i.guild));
@@ -248,11 +415,7 @@ client.on('interactionCreate', async (i) => {
         return reply(i, `✅ Closed tickets will be moved to **${i.options.getChannel('category').name}**.`);
       }
       if (sub === 'delete') {
-        if (!isStaff(i, c)) return reply(i, '❌ Staff only.');
-        if (!c.closed[i.channel.id]) return reply(i, '❌ This is not a closed ticket.');
-        await i.reply('🗑️ Deleting channel...');
-        delete c.closed[i.channel.id]; save();
-        return void setTimeout(() => i.channel.delete('Closed ticket deleted').catch(() => {}), 2000);
+        return deleteClosedTicket(i);
       }
       if (sub === 'category-parent') {
         const id = slug(i.options.getString('name'));
@@ -277,6 +440,70 @@ client.on('interactionCreate', async (i) => {
         await i.channel.permissionOverwrites.delete(user.id);
         return i.reply(`✅ Removed ${user}.`);
       }
+    }
+
+    /* ticket folder settings menu */
+    if (i.isStringSelectMenu() && i.customId === 'ticket_settings_type') {
+      if (!isAdmin(i)) return reply(i, '❌ You need Manage Server permission.');
+      const cat = c.categories.find(x => x.id === i.values[0]);
+      if (!cat) return i.update({ content: 'That ticket type no longer exists. Run `/ticket settings` again.', embeds: [], components: [] });
+      return i.update(ticketSettingsDetail(i.guild, cat));
+    }
+
+    if (i.isButton() && i.customId === 'ticket_settings_default') {
+      if (!isAdmin(i)) return reply(i, '❌ You need Manage Server permission.');
+      return i.update(ticketSettingsDefaultDetail(i.guild));
+    }
+
+    if (i.isChannelSelectMenu() && i.customId === 'ticket_settings_default_parent') {
+      if (!isAdmin(i)) return reply(i, '❌ You need Manage Server permission.');
+      const parent = await i.guild.channels.fetch(i.values[0]);
+      if (!parent || parent.type !== ChannelType.GuildCategory) {
+        return reply(i, '❌ Please select a valid Discord category folder.');
+      }
+      c.parentId = parent.id;
+      save();
+      return i.update(ticketSettingsDefaultDetail(i.guild, `✅ Default folder saved as **${parent.name}**.`));
+    }
+
+    if (i.isButton() && i.customId === 'ticket_settings_default_reset') {
+      if (!isAdmin(i)) return reply(i, '❌ You need Manage Server permission.');
+      c.parentId = null;
+      save();
+      return i.update(ticketSettingsDefaultDetail(i.guild, '✅ The default folder has been cleared.'));
+    }
+
+    if (i.isChannelSelectMenu() && i.customId.startsWith('ticket_settings_parent:')) {
+      if (!isAdmin(i)) return reply(i, '❌ You need Manage Server permission.');
+      const catId = i.customId.slice('ticket_settings_parent:'.length);
+      const cat = c.categories.find(x => x.id === catId);
+      if (!cat) return i.update({ content: 'That ticket type no longer exists. Run `/ticket settings` again.', embeds: [], components: [] });
+
+      const parentId = i.values[0];
+      const parent = await i.guild.channels.fetch(parentId);
+      if (!parent || parent.type !== ChannelType.GuildCategory) {
+        return reply(i, '❌ Please select a valid Discord category folder.');
+      }
+
+      cat.parentId = parent.id;
+      save();
+      return i.update(ticketSettingsDetail(i.guild, cat, `✅ Saved! New **${cat.label}** tickets will go into **${parent.name}**.`));
+    }
+
+    if (i.isButton() && i.customId.startsWith('ticket_settings_reset:')) {
+      if (!isAdmin(i)) return reply(i, '❌ You need Manage Server permission.');
+      const catId = i.customId.slice('ticket_settings_reset:'.length);
+      const cat = c.categories.find(x => x.id === catId);
+      if (!cat) return i.update({ content: 'That ticket type no longer exists. Run `/ticket settings` again.', embeds: [], components: [] });
+
+      cat.parentId = null;
+      save();
+      return i.update(ticketSettingsDetail(i.guild, cat, `✅ **${cat.label}** now uses the default ticket folder.`));
+    }
+
+    if (i.isButton() && i.customId === 'ticket_settings_back') {
+      if (!isAdmin(i)) return reply(i, '❌ You need Manage Server permission.');
+      return i.update(ticketSettingsOverview(i.guild));
     }
 
     /* open ticket from the select menu */
@@ -315,6 +542,11 @@ client.on('interactionCreate', async (i) => {
       );
       await channel.send({ content: `${i.user}${c.staffRoleId ? ` <@&${c.staffRoleId}>` : ''}`, embeds: [embed], components: [row] });
       return i.editReply(`✅ Ticket created: ${channel}`);
+    }
+
+    /* delete button on a closed ticket */
+    if (i.isButton() && i.customId === 'ticket_delete_closed') {
+      return deleteClosedTicket(i);
     }
 
     /* close button -> reason modal */
