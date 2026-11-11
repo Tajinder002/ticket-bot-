@@ -18,6 +18,15 @@ const client = new Client({
 let db = {};
 try { db = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')); } catch { db = {}; }
 const save = () => fs.writeFileSync(DATA_FILE, JSON.stringify(db, null, 2));
+const defaultQuestion = (cat) => {
+  const id = String(cat?.id || '').toLowerCase();
+  const label = String(cat?.label || '').toLowerCase();
+  if (id === 'buy' || label === 'buy') return 'What do you want to buy?';
+  if (id === 'replacement' || label === 'replacement') return 'What do you want to replace?';
+  if (id === 'support' || label === 'support') return 'What support do you need?';
+  if (id === 'other' || label === 'other') return 'How can we help you?';
+  return 'What do you need help with?';
+};
 const cfg = (guildId) => {
   if (!db[guildId]) {
     db[guildId] = {
@@ -33,6 +42,23 @@ const cfg = (guildId) => {
     save();
   }
   if (!db[guildId].closed) db[guildId].closed = {};
+  if (!db[guildId].tickets) db[guildId].tickets = {};
+  if (!Array.isArray(db[guildId].categories)) db[guildId].categories = [];
+
+  // Migrate older saved settings so every ticket type has an opening question.
+  let migrated = false;
+  for (const cat of db[guildId].categories) {
+    if (typeof cat.question !== 'string' || !cat.question.trim()) {
+      cat.question = defaultQuestion(cat);
+      migrated = true;
+    }
+    // Discord modal text-input labels are limited to 45 characters.
+    if (cat.question.length > 45) {
+      cat.question = cat.question.slice(0, 45);
+      migrated = true;
+    }
+  }
+  if (migrated) save();
   return db[guildId];
 };
 
@@ -107,7 +133,7 @@ function ticketSettingsOverview(guild) {
       const routingText = cat.parentId ? 'Custom folder' : 'Uses the default folder';
       embed.addFields({
         name: `${cat.emoji || '🎫'} ${cat.label}`.slice(0, 256),
-        value: `${destinationText}\n_${routingText}_`,
+        value: `${destinationText}\n_${routingText}_\n**Opening question:** ${cat.question || defaultQuestion(cat)}`,
         inline: true,
       });
     }
@@ -151,8 +177,9 @@ function ticketSettingsDetail(guild, cat, notice = '') {
       notice,
       `**Current folder:** ${currentDestination}`,
       routingMode,
+      `**Opening question:** ${cat.question || defaultQuestion(cat)}`,
       '',
-      'Choose a Discord category below. The change is saved automatically and applies to new tickets.',
+      'Choose a Discord category below, or edit the question members answer when opening this ticket type. Changes are saved automatically.',
     ].filter(Boolean).join('\n'))
     .setColor(0x5865f2);
 
@@ -168,6 +195,10 @@ function ticketSettingsDetail(guild, cat, notice = '') {
       .setCustomId(`ticket_settings_reset:${cat.id}`)
       .setLabel('Use default folder')
       .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(`ticket_settings_question:${cat.id}`)
+      .setLabel('Edit opening question')
+      .setStyle(ButtonStyle.Success),
     new ButtonBuilder()
       .setCustomId('ticket_settings_back')
       .setLabel('Back')
@@ -254,7 +285,13 @@ async function buildTranscript(channel) {
   const rows = all.map(m => {
     const time = m.createdAt.toISOString().replace('T', ' ').slice(0, 19);
     let body = esc(m.content);
-    for (const e of m.embeds) body += `<div class="embed">${esc(e.title || '')} ${esc(e.description || '')}</div>`;
+    for (const e of m.embeds) {
+      let embedHtml = `<div class="embed"><b>${esc(e.title || '')}</b><div>${esc(e.description || '')}</div>`;
+      for (const field of (e.fields || [])) {
+        embedHtml += `<p><b>${esc(field.name)}</b><br>${esc(field.value)}</p>`;
+      }
+      body += `${embedHtml}</div>`;
+    }
     for (const a of m.attachments.values()) body += `<div><a href="${esc(a.url)}">📎 ${esc(a.name)}</a></div>`;
     return `<div class="msg"><img src="${m.author.displayAvatarURL({ size: 64 })}"><div><b>${esc(m.author.tag)}</b> <span class="t">${time} UTC</span><div>${body}</div></div></div>`;
   }).join('\n');
@@ -400,7 +437,14 @@ client.on('interactionCreate', async (i) => {
         const name = i.options.getString('name');
         const id = slug(name);
         if (c.categories.some(x => x.id === id)) return reply(i, '❌ That category already exists.');
-        c.categories.push({ id, label: name, emoji: i.options.getString('emoji') || null, description: i.options.getString('description') || null });
+        const newCategory = {
+          id,
+          label: name,
+          emoji: i.options.getString('emoji') || null,
+          description: i.options.getString('description') || null,
+        };
+        newCategory.question = defaultQuestion(newCategory);
+        c.categories.push(newCategory);
         save();
         return reply(i, `✅ Added **${name}**. Run \`/ticket setup\` again to send a fresh panel.`);
       }
@@ -501,21 +545,93 @@ client.on('interactionCreate', async (i) => {
       return i.update(ticketSettingsDetail(i.guild, cat, `✅ **${cat.label}** now uses the default ticket folder.`));
     }
 
+    if (i.isButton() && i.customId.startsWith('ticket_settings_question:')) {
+      if (!isAdmin(i)) return reply(i, '❌ You need Manage Server permission.');
+      const catId = i.customId.slice('ticket_settings_question:'.length);
+      const cat = c.categories.find(x => x.id === catId);
+      if (!cat) return reply(i, '❌ That ticket type no longer exists. Run `/ticket settings` again.');
+
+      const modal = new ModalBuilder()
+        .setCustomId(`ticket_settings_question_modal:${cat.id}`)
+        .setTitle(`Edit ${cat.label} Question`.slice(0, 45))
+        .addComponents(new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('question')
+            .setLabel('Question shown when opening this ticket')
+            .setStyle(TextInputStyle.Short)
+            .setMinLength(1)
+            .setMaxLength(45)
+            .setRequired(true)
+            .setValue((cat.question || defaultQuestion(cat)).slice(0, 45)),
+        ));
+      return i.showModal(modal);
+    }
+
+    if (i.isModalSubmit() && i.customId.startsWith('ticket_settings_question_modal:')) {
+      if (!isAdmin(i)) return reply(i, '❌ You need Manage Server permission.');
+      const catId = i.customId.slice('ticket_settings_question_modal:'.length);
+      const cat = c.categories.find(x => x.id === catId);
+      if (!cat) return reply(i, '❌ That ticket type no longer exists. Run `/ticket settings` again.');
+      const question = i.fields.getTextInputValue('question').trim();
+      if (!question) return reply(i, '❌ Please enter a question.');
+      if (question.length > 45) return reply(i, '❌ The question must be 45 characters or fewer.');
+      cat.question = question;
+      save();
+      return i.reply({
+        ...ticketSettingsDetail(i.guild, cat, `✅ Opening question saved: **${question}**`),
+        flags: MessageFlags.Ephemeral,
+      });
+    }
+
     if (i.isButton() && i.customId === 'ticket_settings_back') {
       if (!isAdmin(i)) return reply(i, '❌ You need Manage Server permission.');
       return i.update(ticketSettingsOverview(i.guild));
     }
 
-    /* open ticket from the select menu */
+    /* select a ticket type -> ask the member for details in a modal */
     if (i.isStringSelectMenu() && i.customId === 'ticket_open') {
       const cat = c.categories.find(x => x.id === i.values[0]);
       if (!cat) return reply(i, '❌ Category no longer exists.');
-      const existing = Object.entries(c.tickets).find(([chId, t]) => t.userId === i.user.id && i.guild.channels.cache.has(chId));
+      const existing = Object.entries(c.tickets).find(([chId, t]) =>
+        t.userId === i.user.id && i.guild.channels.cache.has(chId),
+      );
+      if (existing) return reply(i, `❌ You already have an open ticket: <#${existing[0]}>`);
+
+      const question = (cat.question || defaultQuestion(cat)).slice(0, 45);
+      const modal = new ModalBuilder()
+        .setCustomId(`ticket_open_modal:${cat.id}`)
+        .setTitle(`Open ${cat.label} Ticket`.slice(0, 45))
+        .addComponents(new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('answer')
+            .setLabel(question)
+            .setPlaceholder('Type your answer here...')
+            .setStyle(TextInputStyle.Paragraph)
+            .setMinLength(1)
+            .setMaxLength(1000)
+            .setRequired(true),
+        ));
+      return i.showModal(modal);
+    }
+
+    /* submit opening form -> create the private ticket channel */
+    if (i.isModalSubmit() && i.customId.startsWith('ticket_open_modal:')) {
+      const catId = i.customId.slice('ticket_open_modal:'.length);
+      const cat = c.categories.find(x => x.id === catId);
+      if (!cat) return reply(i, '❌ This ticket type no longer exists. Please use the ticket panel again.');
+
+      const answer = i.fields.getTextInputValue('answer').trim();
+      if (!answer) return reply(i, '❌ Please answer the question before opening a ticket.');
+
+      const existing = Object.entries(c.tickets).find(([chId, t]) =>
+        t.userId === i.user.id && i.guild.channels.cache.has(chId),
+      );
       if (existing) return reply(i, `❌ You already have an open ticket: <#${existing[0]}>`);
 
       await i.deferReply({ flags: MessageFlags.Ephemeral });
       c.counter += 1;
       const number = c.counter;
+      const question = (cat.question || defaultQuestion(cat)).slice(0, 45);
       const overwrites = [
         { id: i.guild.id, deny: [PermissionFlagsBits.ViewChannel] },
         { id: i.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles] },
@@ -530,12 +646,20 @@ client.on('interactionCreate', async (i) => {
         topic: `Ticket #${number} | ${cat.label} | opened by ${i.user.tag}`,
         permissionOverwrites: overwrites,
       });
-      c.tickets[channel.id] = { userId: i.user.id, category: cat.label, number };
+      c.tickets[channel.id] = {
+        userId: i.user.id,
+        category: cat.label,
+        categoryId: cat.id,
+        number,
+        openingQuestion: question,
+        openingAnswer: answer,
+      };
       save();
 
       const embed = new EmbedBuilder()
         .setTitle(`${cat.emoji || '🎫'} ${cat.label} Ticket`)
-        .setDescription(`Hello ${i.user}, staff will be with you soon.\nPlease describe your issue in detail.`)
+        .setDescription(`Hello ${i.user}, staff will be with you soon.\nPlease describe any additional details in this channel.`)
+        .addFields({ name: question, value: answer.slice(0, 1024) })
         .setColor(0x57f287);
       const row = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId('ticket_close').setLabel('Close Ticket').setEmoji('🔒').setStyle(ButtonStyle.Danger),
