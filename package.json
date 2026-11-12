@@ -1,0 +1,22 @@
+{
+  "name": "discord-all-in-one-server-bot",
+  "version": "1.0.1",
+  "private": true,
+  "description": "Discord ticket, restock, verification and music bot using discord.js v14",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "check": "node --check index.js"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "dependencies": {
+    "@distube/discordjs": "latest",
+    "@distube/youtube": "^1.1.0",
+    "@discordjs/voice": "^0.19.2",
+    "discord.js": "^14.28.1",
+    "distube": "^5.2.3",
+    "dotenv": "^16.4.7"
+  }
+}
