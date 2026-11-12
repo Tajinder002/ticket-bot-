@@ -9,9 +9,14 @@ const {
 } = require('discord.js');
 
 const DATA_DIR = process.env.DATA_DIR || __dirname;
+fs.mkdirSync(DATA_DIR, { recursive: true });
 const DATA_FILE = path.join(DATA_DIR, 'data.json');
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+  ],
 });
 
 /* ---------- simple JSON storage ---------- */
@@ -27,27 +32,35 @@ const defaultQuestion = (cat) => {
   if (id === 'other' || label === 'other') return 'How can we help you?';
   return 'What do you need help with?';
 };
+
 const cfg = (guildId) => {
   if (!db[guildId]) {
     db[guildId] = {
-      transcriptChannelId: null, staffRoleId: null, parentId: null, closedParentId: null, counter: 0,
+      transcriptChannelId: null,
+      staffRoleId: null,
+      parentId: null,
+      closedParentId: null,
+      counter: 0,
       categories: [
         { id: 'buy', label: 'Buy', emoji: '🛒', description: 'Purchase questions' },
         { id: 'replacement', label: 'Replacement', emoji: '🔁', description: 'Request a replacement' },
         { id: 'support', label: 'Support', emoji: '🛠️', description: 'General support' },
         { id: 'other', label: 'Other', emoji: '❓', description: 'Anything else' },
       ],
-      tickets: {}, closed: {},
+      tickets: {},
+      closed: {},
     };
     save();
   }
-  if (!db[guildId].closed) db[guildId].closed = {};
-  if (!db[guildId].tickets) db[guildId].tickets = {};
-  if (!Array.isArray(db[guildId].categories)) db[guildId].categories = [];
+
+  const guildConfig = db[guildId];
+  let migrated = false;
+  if (!guildConfig.closed || typeof guildConfig.closed !== 'object') guildConfig.closed = {};
+  if (!guildConfig.tickets || typeof guildConfig.tickets !== 'object') guildConfig.tickets = {};
+  if (!Array.isArray(guildConfig.categories)) guildConfig.categories = [];
 
   // Migrate older saved settings so every ticket type has an opening question.
-  let migrated = false;
-  for (const cat of db[guildId].categories) {
+  for (const cat of guildConfig.categories) {
     if (typeof cat.question !== 'string' || !cat.question.trim()) {
       cat.question = defaultQuestion(cat);
       migrated = true;
@@ -59,7 +72,7 @@ const cfg = (guildId) => {
     }
   }
   if (migrated) save();
-  return db[guildId];
+  return guildConfig;
 };
 
 /* ---------- slash commands ---------- */
@@ -72,39 +85,70 @@ const commands = [
       .addChannelOption(o => o.setName('channel').setDescription('Transcript channel').addChannelTypes(ChannelType.GuildText).setRequired(true)))
     .addSubcommand(s => s.setName('staff-role').setDescription('Role that can see all tickets')
       .addRoleOption(o => o.setName('role').setDescription('Staff role').setRequired(true)))
-    .addSubcommand(s => s.setName('parent').setDescription('Discord category where tickets are created')
-      .addChannelOption(o => o.setName('category').setDescription('Discord category').addChannelTypes(ChannelType.GuildCategory).setRequired(true)))
     .addSubcommand(s => s.setName('closed-category').setDescription('Discord category where closed tickets are moved')
       .addChannelOption(o => o.setName('category').setDescription('Discord category for closed tickets').addChannelTypes(ChannelType.GuildCategory).setRequired(true)))
-    .addSubcommand(s => s.setName('delete').setDescription('Delete this closed ticket channel (staff)'))
     .addSubcommand(s => s.setName('category-add').setDescription('Add a ticket category')
       .addStringOption(o => o.setName('name').setDescription('Name, e.g. Billing').setRequired(true))
       .addStringOption(o => o.setName('emoji').setDescription('Emoji'))
       .addStringOption(o => o.setName('description').setDescription('Short description')))
     .addSubcommand(s => s.setName('category-remove').setDescription('Remove a ticket category')
       .addStringOption(o => o.setName('name').setDescription('Category name').setRequired(true)))
-    .addSubcommand(s => s.setName('category-parent').setDescription('Set which Discord category a ticket type is created in')
-      .addStringOption(o => o.setName('name').setDescription('Ticket category name, e.g. Buy').setRequired(true))
-      .addChannelOption(o => o.setName('category').setDescription('Discord category (leave empty to reset)').addChannelTypes(ChannelType.GuildCategory)))
-    .addSubcommand(s => s.setName('category-list').setDescription('List ticket categories'))
-    .addSubcommand(s => s.setName('close').setDescription('Close this ticket')
-      .addStringOption(o => o.setName('reason').setDescription('Reason')))
     .addSubcommand(s => s.setName('add').setDescription('Add a user to this ticket')
       .addUserOption(o => o.setName('user').setDescription('User').setRequired(true)))
     .addSubcommand(s => s.setName('remove').setDescription('Remove a user from this ticket')
       .addUserOption(o => o.setName('user').setDescription('User').setRequired(true))),
+
 ].map(c => c.toJSON());
 
 async function registerCommands(guild) {
   try { await guild.commands.set(commands); } catch (e) { console.error('Command register failed', guild.id, e.message); }
 }
 
+async function refreshClosedTicketControls(guild) {
+  const c = cfg(guild.id);
+  for (const channelId of Object.keys(c.closed)) {
+    try {
+      const channel = await guild.channels.fetch(channelId);
+      if (!channel || !channel.messages) continue;
+      const messages = await channel.messages.fetch({ limit: 100 });
+      const controlMessage = messages.find(message =>
+        message.author.id === client.user.id &&
+        message.components.some(row => row.components.some(component => component.customId === 'ticket_delete_closed')),
+      );
+      if (!controlMessage) continue;
+
+      const alreadyHasReopen = controlMessage.components.some(row =>
+        row.components.some(component => component.customId === 'ticket_reopen_closed'),
+      );
+      if (alreadyHasReopen) continue;
+
+      const controls = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId('ticket_reopen_closed')
+          .setLabel('Reopen Ticket')
+          .setEmoji('🔓')
+          .setStyle(ButtonStyle.Success),
+        new ButtonBuilder()
+          .setCustomId('ticket_delete_closed')
+          .setLabel('Delete')
+          .setEmoji('🗑️')
+          .setStyle(ButtonStyle.Danger),
+      );
+      await controlMessage.edit({ components: [controls] });
+    } catch (err) {
+      console.error(`Could not refresh closed-ticket controls in ${channelId}:`, err.message);
+    }
+  }
+}
+
 client.once('ready', async () => {
   console.log(`Logged in as ${client.user.tag}`);
-  for (const guild of client.guilds.cache.values()) await registerCommands(guild);
+  for (const guild of client.guilds.cache.values()) {
+    await registerCommands(guild);
+    await refreshClosedTicketControls(guild);
+  }
 });
 client.on('guildCreate', registerCommands);
-
 /* ---------- helpers ---------- */
 const isAdmin = (i) => i.memberPermissions.has(PermissionFlagsBits.ManageGuild);
 const isStaff = (i, c) =>
@@ -324,6 +368,107 @@ async function deleteClosedTicket(i) {
   }
 }
 
+async function reopenClosedTicket(i) {
+  const c = cfg(i.guild.id);
+  const channel = i.channel;
+  const t = c.closed[channel.id];
+
+  if (!isStaff(i, c)) return reply(i, '❌ Staff only.');
+  if (!t) return reply(i, '❌ This ticket is not closed or has already been reopened.');
+
+  await i.deferUpdate();
+  const originalParentId = channel.parentId;
+  const originalChannelName = channel.name;
+
+  try {
+    // Reopen in the ticket type's current folder, falling back to the default folder.
+    const ticketCategory = c.categories.find(cat => cat.id === t.categoryId)
+      || c.categories.find(cat => cat.label === t.category);
+    const parentId = (ticketCategory && ticketCategory.parentId) || c.parentId || null;
+    let parent = null;
+
+    if (parentId) {
+      parent = await i.guild.channels.fetch(parentId);
+      if (!parent || parent.type !== ChannelType.GuildCategory) {
+        throw new Error('The configured folder for this ticket no longer exists. Update it in `/ticket settings`.');
+      }
+    }
+
+    // Restore the ticket owner's access, move it back to the configured open-ticket folder,
+    // and remove the closed- prefix from the channel name.
+    await channel.permissionOverwrites.edit(t.userId, {
+      ViewChannel: true,
+      SendMessages: true,
+      ReadMessageHistory: true,
+      AttachFiles: true,
+    });
+    await channel.setParent(parent ? parent.id : null, { lockPermissions: false });
+    if (channel.name.startsWith('closed-')) {
+      await channel.setName(channel.name.slice('closed-'.length).slice(0, 100));
+    }
+
+    const reopenedTicket = {
+      ...t,
+      reopenedBy: i.user.id,
+      reopenedAt: new Date().toISOString(),
+    };
+    delete c.closed[channel.id];
+    c.tickets[channel.id] = reopenedTicket;
+    save();
+
+    const embed = new EmbedBuilder()
+      .setTitle('🔓 Ticket Reopened')
+      .setDescription(`This ticket has been reopened by ${i.user}. The ticket owner can access this channel again.`)
+      .addFields(
+        { name: 'Ticket', value: `#${String(t.number).padStart(4, '0')}`, inline: true },
+        { name: 'Category', value: t.category || 'Other', inline: true },
+        { name: 'Opened by', value: `<@${t.userId}>`, inline: true },
+      )
+      .setColor(0x57f287)
+      .setTimestamp();
+
+    const closeRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId('ticket_close')
+        .setLabel('Close Ticket')
+        .setEmoji('🔒')
+        .setStyle(ButtonStyle.Danger),
+    );
+
+    await channel.send({ embeds: [embed], components: [closeRow] }).catch(err => {
+      console.error('Could not post reopened-ticket message:', err);
+    });
+
+    // Remove Reopen/Delete controls from the old closed-ticket message.
+    await i.message.edit({
+      embeds: [new EmbedBuilder()
+        .setTitle('✅ Ticket Reopened')
+        .setDescription(`Reopened by ${i.user}. Use the Close Ticket button in the channel when this ticket is finished.`)
+        .setColor(0x57f287)
+        .setTimestamp()],
+      components: [],
+    }).catch(err => console.error('Could not update old closed-ticket message:', err));
+
+    await i.followUp({ content: `✅ Reopened ${channel}. The ticket owner has access again.`, flags: MessageFlags.Ephemeral });
+  } catch (err) {
+    console.error('Ticket reopen failed:', err);
+
+    // Best-effort rollback: restore the channel's original closed location and name.
+    await channel.permissionOverwrites.edit(t.userId, { ViewChannel: false }).catch(() => {});
+    if (channel.parentId !== originalParentId) {
+      await channel.setParent(originalParentId, { lockPermissions: false }).catch(() => {});
+    }
+    if (channel.name !== originalChannelName) {
+      await channel.setName(originalChannelName).catch(() => {});
+    }
+
+    await i.followUp({
+      content: `❌ Could not reopen this ticket (${err.message}). Check the bot's Manage Channels permission and the selected ticket folder.`,
+      flags: MessageFlags.Ephemeral,
+    }).catch(() => {});
+  }
+}
+
 async function closeTicket(i, reason) {
   const c = cfg(i.guild.id);
   const channel = i.channel;
@@ -385,7 +530,12 @@ async function closeTicket(i, reason) {
     problems.push(`Could not move/lock the channel (${e.message}). Give the bot Manage Channels in that category.`);
   }
 
-  const deleteRow = new ActionRowBuilder().addComponents(
+  const closedTicketRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('ticket_reopen_closed')
+      .setLabel('Reopen Ticket')
+      .setEmoji('🔓')
+      .setStyle(ButtonStyle.Success),
     new ButtonBuilder()
       .setCustomId('ticket_delete_closed')
       .setLabel('Delete')
@@ -395,8 +545,8 @@ async function closeTicket(i, reason) {
 
   await channel.send({
     content: problems.length ? `⚠️ ${problems.join('\n')}` : undefined,
-    embeds: [embed.setDescription('This ticket is closed. Staff can delete it using the button below.')],
-    components: [deleteRow],
+    embeds: [embed.setDescription('This ticket is closed. Staff can reopen it or permanently delete it using the buttons below.')],
+    components: [closedTicketRow],
   }).catch((err) => console.error('Could not post closed-ticket controls:', err));
 }
 
@@ -409,7 +559,7 @@ client.on('interactionCreate', async (i) => {
     /* slash commands */
     if (i.isChatInputCommand() && i.commandName === 'ticket') {
       const sub = i.options.getSubcommand();
-      const adminOnly = ['settings', 'setup', 'transcript-channel', 'staff-role', 'parent', 'category-add', 'category-remove', 'category-parent', 'closed-category'];
+      const adminOnly = ['settings', 'setup', 'transcript-channel', 'staff-role', 'category-add', 'category-remove', 'closed-category'];
       if (adminOnly.includes(sub) && !isAdmin(i)) return reply(i, '❌ You need Manage Server permission.');
 
       if (sub === 'settings') {
@@ -427,10 +577,6 @@ client.on('interactionCreate', async (i) => {
       if (sub === 'staff-role') {
         c.staffRoleId = i.options.getRole('role').id; save();
         return reply(i, `✅ Staff role set to <@&${c.staffRoleId}>.`);
-      }
-      if (sub === 'parent') {
-        c.parentId = i.options.getChannel('category').id; save();
-        return reply(i, '✅ Tickets will be created in that category.');
       }
       if (sub === 'category-add') {
         if (c.categories.length >= 25) return reply(i, '❌ Max 25 categories.');
@@ -458,21 +604,6 @@ client.on('interactionCreate', async (i) => {
         c.closedParentId = i.options.getChannel('category').id; save();
         return reply(i, `✅ Closed tickets will be moved to **${i.options.getChannel('category').name}**.`);
       }
-      if (sub === 'delete') {
-        return deleteClosedTicket(i);
-      }
-      if (sub === 'category-parent') {
-        const id = slug(i.options.getString('name'));
-        const cat = c.categories.find(x => x.id === id);
-        if (!cat) return reply(i, '❌ Ticket category not found. Use `/ticket category-list`.');
-        const parent = i.options.getChannel('category');
-        cat.parentId = parent ? parent.id : null; save();
-        return reply(i, parent ? `✅ **${cat.label}** tickets will now open inside **${parent.name}**.` : `✅ **${cat.label}** reset to the default category.`);
-      }
-      if (sub === 'category-list') {
-        return reply(i, c.categories.map(x => `${x.emoji || '•'} **${x.label}** — ${x.description || ''}`).join('\n') || 'No categories.');
-      }
-      if (sub === 'close') return closeTicket(i, i.options.getString('reason'));
       if (sub === 'add' || sub === 'remove') {
         if (!c.tickets[i.channel.id]) return reply(i, 'This is not a ticket channel.');
         if (!isStaff(i, c)) return reply(i, '❌ Staff only.');
@@ -668,7 +799,10 @@ client.on('interactionCreate', async (i) => {
       return i.editReply(`✅ Ticket created: ${channel}`);
     }
 
-    /* delete button on a closed ticket */
+    /* buttons on a closed ticket */
+    if (i.isButton() && i.customId === 'ticket_reopen_closed') {
+      return reopenClosedTicket(i);
+    }
     if (i.isButton() && i.customId === 'ticket_delete_closed') {
       return deleteClosedTicket(i);
     }
